@@ -7,48 +7,76 @@
 
 /**
  * @file fake_gpiod.h
- * @brief Control surface for the in-process libgpiod v2 fake.
+ * @brief Control surface for the in-process libgpiod fake.
  *
  * LinuxGPIOPin talks to real GPIO character devices, which unit tests cannot
  * open: /dev/gpiochip* requires hardware (or the gpio-sim kernel module plus
- * root).  fake_gpiod.cpp instead defines the handful of libgpiod symbols that
+ * root).  fake_gpiod.cpp instead defines the libgpiod symbols that
  * LinuxGPIOPin.cpp references, so the test binary links against the fake and
  * never reaches the real library.  Tests drive the error paths by setting the
  * knobs below and assert on the counters afterwards.
  *
+ * The fake implements **both** library APIs, selected by the same probe
+ * LinuxGPIOPin.h uses, because the two are installed on different machines that
+ * matter: CI runs libgpiod 1.x (Ubuntu ships 1.6.3) while the deployment
+ * targets run 2.x.  Where the two APIs express the same intent differently, the
+ * fake normalises it -- see FakeDirection -- so a test asserting on behavior
+ * common to both versions needs no `#if`.
+ *
  * @see fake_gpiod.cpp for the symbol definitions.
  */
+
+/**
+ * Line direction, normalised across the two libgpiod APIs.
+ *
+ * v2 expresses direction as a gpiod_line_settings property; v1 expresses it by
+ * which request function is called.  The fake records this enum either way.
+ */
+enum FakeDirection {
+    FakeDirUnset = -1, ///< nothing has configured a direction yet
+    FakeDirAsIs = 0,   ///< requested without changing the line's direction
+    FakeDirInput = 1,  ///< configured as an input
+    FakeDirOutput = 2, ///< configured as an output
+};
+
+/** Knobs and counters for the fake libgpiod used by the LinuxGPIOPin tests. */
 struct FakeGpiod {
     // ─── Knobs: make a libgpiod call fail ────────────────────────────────────
 
-    /** Make gpiod_chip_open() return NULL (chip missing / not permitted). */
+    /** Make the chip open fail (chip missing or not permitted). */
     bool chip_open_fails = false;
-    /** Make gpiod_chip_request_lines() return NULL (line already claimed). */
+    /**
+     * Make line acquisition fail, i.e. the line is already claimed.
+     *
+     * Normalised across versions: v2's gpiod_chip_request_lines() returns NULL,
+     * v1's gpiod_line_request() returns -1.
+     */
     bool request_lines_fails = false;
-    /** Offset reported by gpiod_chip_get_line_offset_from_name(); -1 = no such name. */
+    /** Offset reported by gpiod_chip_get_line_offset_from_name(); -1 = no such name. (v2) */
     int name_lookup_offset = 7;
-    /** Return value of gpiod_line_config_add_line_settings(). */
+    /** Return value of gpiod_line_config_add_line_settings(). (v2) */
     int add_line_settings_ret = 0;
-    /** Value reported by gpiod_line_request_get_value(); -1 = GPIOD_LINE_VALUE_ERROR. */
+    /** Value reported by the line read; -1 = the library's error sentinel. */
     int get_value_ret = 1;
-    /** Return value of gpiod_line_request_set_value(); -1 signals failure. */
+    /** Return value of the line write; non-zero signals failure. */
     int set_value_ret = 0;
-    /** Return value of gpiod_line_request_reconfigure_lines(). */
+    /** Return value of gpiod_line_request_reconfigure_lines(). (v2) */
     int reconfigure_ret = 0;
     /** errno the fake sets before returning a failure, so strerror() has input. */
     int fail_errno = 16 /* EBUSY */;
 
     // ─── Counters and captured arguments ─────────────────────────────────────
 
-    int chip_open_count = 0;        ///< successful gpiod_chip_open() calls
-    int chip_close_count = 0;       ///< gpiod_chip_close() calls with a live handle
-    int chip_close_null_count = 0;  ///< gpiod_chip_close() calls with NULL
-    int line_release_count = 0;     ///< gpiod_line_request_release() calls
-    unsigned last_offset = 0;       ///< offset handed to add_line_settings()
-    int last_direction = -1;        ///< direction handed to set_direction()
-    int last_output_value = -1;     ///< value handed to set_output_value()
-    int last_written = -1;          ///< value handed to set_value()
-    const char *last_consumer = nullptr; ///< consumer handed to set_consumer()
+    int chip_open_count = 0;        ///< successful chip opens
+    int chip_close_count = 0;       ///< chip closes with a live handle
+    int chip_close_null_count = 0;  ///< chip closes with NULL (v2 only; see getLine)
+    int line_release_count = 0;     ///< line releases
+    unsigned last_offset = 0;       ///< offset the line was requested at
+    const char *last_line_name = nullptr; ///< name the line was looked up by
+    int last_direction = FakeDirUnset;    ///< normalised direction last configured
+    int last_output_value = -1;     ///< output value last seeded
+    int last_written = -1;          ///< value last written to the line
+    const char *last_consumer = nullptr;  ///< consumer label last set
 
     /** Restore every knob and counter to its default. Call at test start. */
     void reset() { *this = FakeGpiod(); }

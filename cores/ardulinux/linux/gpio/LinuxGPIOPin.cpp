@@ -226,6 +226,8 @@ gpiod_line *LinuxGPIOPin::getLine(const char *chipLabel, const char *linuxPinNam
 		consumer, GPIOD_LINE_REQUEST_DIRECTION_AS_IS, 0};
 	auto result = gpiod_line_request(line, &request, 0);
 	if(result != 0) {
+		gpiod_chip_close(chip);
+		chip = NULL;
 		throw std::invalid_argument("Error, cannot open GPIO chip");
 	}
 	return line;
@@ -295,6 +297,8 @@ gpiod_line *LinuxGPIOPin::getLine(const char *chipLabel, const int linuxPinNum) 
 		consumer, GPIOD_LINE_REQUEST_DIRECTION_AS_IS, 0};
 	auto result = gpiod_line_request(line, &request, 0);
 	if(result != 0) {
+		gpiod_chip_close(chip);
+		chip = NULL;
 		throw std::invalid_argument("Error, cannot open GPIO chip");
 	}
 	return line;
