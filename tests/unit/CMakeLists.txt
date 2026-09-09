@@ -84,3 +84,32 @@ if(LIBGPIOD_FOUND)
     endif()
     catch_discover_tests(ardulinux-i2c-tests)
 endif()
+
+# ─── LinuxGPIOPin tests ──────────────────────────────────────────────────────
+# LinuxGPIOPin drives real GPIO character devices, which a unit test cannot
+# open (/dev/gpiochip* needs hardware, or gpio-sim plus root).  fake_gpiod.cpp
+# defines the libgpiod symbols LinuxGPIOPin.cpp references; because those
+# definitions come from an object file linked directly into this executable,
+# they win over the shared library and no device is ever touched.
+#
+# A separate executable is required so the fake's gpiod_* symbols cannot
+# displace the real ones in ardulinux-tests, which links libgpiod for the I2C
+# and SPI paths.  Built only when LIBGPIOD_FOUND, since LinuxGPIOPin.cpp is
+# guarded by ARDULINUX_HARDWARE and needs <gpiod.h>.
+if(LIBGPIOD_FOUND)
+    add_executable(ardulinux-gpio-tests
+        test_linux_gpio.cpp
+        fake_gpiod.cpp
+        ${CMAKE_SOURCE_DIR}/cores/ardulinux/linux/gpio/LinuxGPIOPin.cpp
+    )
+    target_link_libraries(ardulinux-gpio-tests PRIVATE ardulinux-base Catch2::Catch2WithMain)
+    target_include_directories(ardulinux-gpio-tests PRIVATE
+        ${CMAKE_SOURCE_DIR}/cores/ardulinux
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    if(CMAKE_BUILD_TYPE STREQUAL "Coverage")
+        target_compile_options(ardulinux-gpio-tests PRIVATE --coverage -O0 -g)
+        target_link_options(ardulinux-gpio-tests PRIVATE --coverage)
+    endif()
+    catch_discover_tests(ardulinux-gpio-tests)
+endif()

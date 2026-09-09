@@ -59,7 +59,15 @@
  */
 class LinuxGPIOPin : public GPIOPin {
   gpiod_line *line;   ///< Acquired GPIO line handle (type aliased for v1/v2)
-  gpiod_chip *chip;   ///< GPIO chip handle (kept open for reconfiguration)
+  /**
+   * GPIO chip handle.
+   *
+   * Under gpiod v1 the chip is held open for the lifetime of the pin and
+   * closed by the destructor.  Under gpiod v2 a line request outlives the
+   * chip it came from, so getLine() closes the chip as soon as the request
+   * succeeds and resets this to NULL; the destructor's close is then a no-op.
+   */
+  gpiod_chip *chip;
 
 public:
 
@@ -73,6 +81,11 @@ public:
    * @param linuxPinName    Name of the GPIO line within the chip.
    * @param ardulinuxPinName Human-readable name for log messages (defaults to
    *                        linuxPinName if NULL).
+   * @throws std::invalid_argument if the chip is not found, the chip has no
+   *         line by that name, or the line cannot be acquired.  Acquisition is
+   *         deliberately a construction-time failure: a pin that cannot be
+   *         claimed is a configuration error, and the caller should learn that
+   *         when it binds the pin rather than on first use.
    */
   LinuxGPIOPin(pin_size_t n, const char *chipLabel, const char *linuxPinName, const char *ardulinuxPinName = NULL);
 
@@ -83,6 +96,9 @@ public:
    * @param chipLabel       Label of the gpiochip device.
    * @param linuxPinNum     Zero-based offset of the GPIO line within the chip.
    * @param ardulinuxPinName Human-readable name for log messages.
+   * @throws std::invalid_argument if the chip is not found, the offset is
+   *         negative, or the line cannot be acquired.  See the by-name
+   *         constructor for why this fails at construction time.
    */
   LinuxGPIOPin(pin_size_t n, const char *chipLabel, const int linuxPinNum, const char *ardulinuxPinName);
 
@@ -90,7 +106,15 @@ public:
   ~LinuxGPIOPin();
 
 protected:
-  /** Read the current hardware pin level via gpiod_line_get_value(). */
+  /**
+   * Read the current hardware pin level via gpiod_line_get_value().
+   *
+   * @return LOW or HIGH.
+   * @throws std::runtime_error if libgpiod reports an error.  The value is
+   *         never passed through: gpiod signals failure with
+   *         GPIOD_LINE_VALUE_ERROR (-1), which is not a valid PinStatus and
+   *         would otherwise be cached as pin state and fire a spurious ISR.
+   */
   virtual PinStatus readPinHardware();
 
   /**
@@ -98,6 +122,15 @@ protected:
    *
    * Some libraries omit the pinMode(OUTPUT) call; this method silently
    * promotes the pin to output to avoid a silent no-op.
+   *
+   * The hardware is driven before the new level is cached, so a rejected
+   * write leaves the cached state untouched.  That ordering matters: once the
+   * mode is OUTPUT, refreshState() stops re-reading the hardware, so a value
+   * cached for a write that never landed would be returned by digitalRead()
+   * for the rest of the process's life.
+   *
+   * @param s Logic level to drive.
+   * @throws std::runtime_error if libgpiod rejects the write.
    */
   virtual void writePin(PinStatus s);
 
@@ -106,10 +139,26 @@ protected:
    *
    * Uses gpiod_line_release + gpiod_line_request_* (v1) or
    * gpiod_line_request_reconfigure_lines (v2).
+   *
+   * A failed reconfiguration is logged at LogError and does not throw: this is
+   * reached from writePin()'s auto-promotion path, where throwing would turn a
+   * recoverable reconfiguration into a lost write.  The cached mode is rolled
+   * back instead, because the line kept its old direction and `mode` is what
+   * gates refreshState() -- a stale OUTPUT would stop all hardware reads and
+   * freeze digitalRead() at its last cached level.
+   *
+   * @param m Direction and bias to apply.
    */
   virtual void setPinMode(PinMode m);
 
-  unsigned int offset; ///< Line offset within the chip (used by gpiod v2)
+  /**
+   * Line offset within the chip.
+   *
+   * Assigned by the gpiod v2 paths in getLine(); the v1 paths address the
+   * line through its own handle and never read this.  Initialised anyway so
+   * the member is never indeterminate, since it is declared unconditionally.
+   */
+  unsigned int offset = 0;
 
 private:
   /**
@@ -117,7 +166,9 @@ private:
    *
    * @param chipLabel    gpiochip label or device name.
    * @param linuxPinNum  Line offset within the chip.
-   * @return Acquired line handle; throws std::invalid_argument on failure.
+   * @return Acquired line handle.
+   * @throws std::invalid_argument if the chip is not found, the offset is
+   *         negative, or the line cannot be acquired.
    */
   gpiod_line *getLine(const char *chipLabel, const int linuxPinNum);
 
@@ -126,9 +177,23 @@ private:
    *
    * @param chipLabel    gpiochip label or device name.
    * @param linuxPinName Line name as reported by the kernel.
-   * @return Acquired line handle; throws std::invalid_argument on failure.
+   * @return Acquired line handle.
+   * @throws std::invalid_argument if the chip is not found, the chip has no
+   *         line by that name, or the line cannot be acquired.
    */
   gpiod_line *getLine(const char *chipLabel, const char *linuxPinName);
+
+  /**
+   * Throw a std::runtime_error identifying this pin and the failed operation.
+   *
+   * Shared by readPinHardware() and writePin() so both report a libgpiod
+   * failure in the same form, including errno, the line offset (gpiod v2),
+   * the pin name and the Arduino pin number.
+   *
+   * @param op Verb naming the failed operation, e.g. "read" or "write".
+   * @throws std::runtime_error always; the function never returns.
+   */
+  [[noreturn]] void throwLineError(const char *op) const;
 
   /** @defgroup gpiod_v2_compat gpiod v2 compatibility shims
    *
