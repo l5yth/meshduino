@@ -25,19 +25,19 @@ framework = arduino
 board = ardulinux
 ```
 
-Hardware support is gated on **libgpiod**: if `pkg-config` finds it, real GPIO/I2C are compiled in — this also links **libi2c**, so install the two together. If libgpiod is absent, the build uses fully simulated GPIO/I2C and needs no hardware libraries.
+Hardware support is gated on **libgpiod**: if `pkg-config` finds it, real GPIO/I2C are compiled in; this also links **libi2c**, so install the two together. If libgpiod is absent, the build uses fully simulated GPIO/I2C and needs no hardware libraries.
 
 ## Building standalone (CMake)
 
 Requires GCC or Clang (C++14), CMake 3.17+, and pkg-config. Hardware GPIO/I2C are enabled when libgpiod is detected; libgpiod also requires libi2c, so install both together (or neither, for a simulated build).
 
-ArduinoCore-API and WiFi are git submodules — clone with them, or initialise them after cloning:
+ArduinoCore-API and WiFi are git submodules. Clone with them, or initialise them after cloning:
 ```sh
 git clone --recurse-submodules https://github.com/l5yth/ardulinux.git
 # already cloned?  →  git submodule update --init --recursive
 ```
 
-Install the build dependencies — on Debian/Ubuntu:
+Install the build dependencies. On Debian/Ubuntu:
 ```sh
 sudo apt-get install build-essential cmake libgpiod-dev libi2c-dev pkg-config
 ```
@@ -107,7 +107,7 @@ The VFS root defaults to `$XDG_DATA_HOME/<app>/default` (i.e. `~/.local/share/ar
 
 ### Customizing program identity
 
-The platform reads four optional weak symbols. Define any of them as plain (non-weak) definitions in an application source file to override the defaults — no header required:
+The platform reads four optional weak symbols. Define any of them as plain (non-weak) definitions in an application source file to override the defaults. No header required:
 
 ```cpp
 const char *ardulinuxAppName        = "meshcored";                          // startup msg, VFS dir, libgpiod label (default "ardulinux")
