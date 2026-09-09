@@ -182,7 +182,18 @@ gpiod_line *LinuxGPIOPin::getLine(const char *chipLabel, const char *linuxPinNam
 	struct gpiod_line_config *line_cfg;
 	struct gpiod_request_config *req_cfg = NULL;
 	struct gpiod_line_request *line = NULL;
-    offset = gpiod_chip_get_line_offset_from_name(chip, linuxPinName);
+	// Returns -1 (ENOENT) for an unknown name; assigning that to the unsigned
+	// member would request offset 4294967295 instead of reporting the typo.
+	int named_offset = gpiod_chip_get_line_offset_from_name(chip, linuxPinName);
+	if (named_offset < 0) {
+		gpiod_chip_close(chip);
+		chip = NULL;
+		char msg[128];
+		snprintf(msg, sizeof(msg), "Error, no GPIO line named '%s' on %s",
+			linuxPinName ? linuxPinName : "?", chipLabel ? chipLabel : "?");
+		throw std::invalid_argument(msg);
+	}
+	offset = (unsigned int) named_offset;
 	settings = gpiod_line_settings_new();
 	gpiod_line_settings_set_direction(settings, GPIOD_LINE_REQUEST_DIRECTION_AS_IS);
 	line_cfg = gpiod_line_config_new();
@@ -229,12 +240,26 @@ gpiod_line *LinuxGPIOPin::getLine(const char *chipLabel, const int linuxPinNum) 
   if (!chip)
     throw std::invalid_argument("GPIO chip not found");
 
+  // Guard before either library path: a negative offset (a config parser's
+  // "unset" sentinel, say) is unsigned on both sides -- v2's `offset` member
+  // and v1's gpiod_chip_get_line() -- so it would wrap to 4294967295 and be
+  // requested as if it were a real line.  Deliberately outside the #if: the
+  // check needs no version-specific API.
+  if (linuxPinNum < 0) {
+    gpiod_chip_close(chip);
+    chip = NULL;
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Error, invalid GPIO line offset %d on %s",
+             linuxPinNum, chipLabel ? chipLabel : "?");
+    throw std::invalid_argument(msg);
+  }
+
 #if GPIOD_V == 2
 	struct gpiod_line_settings *settings;
 	struct gpiod_line_config *line_cfg;
 	struct gpiod_request_config *req_cfg = NULL;
 	struct gpiod_line_request *line = NULL;
-    offset = linuxPinNum;
+	offset = (unsigned int) linuxPinNum;
 	settings = gpiod_line_settings_new();
 	gpiod_line_settings_set_direction(settings, GPIOD_LINE_REQUEST_DIRECTION_AS_IS);
 	line_cfg = gpiod_line_config_new();
@@ -262,7 +287,9 @@ gpiod_line *LinuxGPIOPin::getLine(const char *chipLabel, const int linuxPinNum) 
 	}
 	return line;
 #else
-	auto line = gpiod_chip_get_line(chip, linuxPinNum);
+	// The negative guard above makes this conversion safe; make it explicit so
+	// the intent is not mistaken for the sign bug that guard exists to prevent.
+	auto line = gpiod_chip_get_line(chip, (unsigned int) linuxPinNum);
 
 	struct gpiod_line_request_config request = {
 		consumer, GPIOD_LINE_REQUEST_DIRECTION_AS_IS, 0};
@@ -296,10 +323,32 @@ LinuxGPIOPin::~LinuxGPIOPin() {
     gpiod_chip_close(chip);
 }
 
+/**
+ * Report a libgpiod failure on this line as an exception.
+ *
+ * assert() is not usable here: it is compiled out under NDEBUG, which is what
+ * release builds define, so a runtime gpiod error would go unreported.
+ */
+void LinuxGPIOPin::throwLineError(const char *op) const {
+  char msg[160];
+#if GPIOD_V == 2
+  snprintf(msg, sizeof(msg), "Error, cannot %s GPIO line %u ('%s', pin %u): %s",
+           op, offset, getName(), (unsigned) getPinNum(), strerror(errno));
+#else
+  snprintf(msg, sizeof(msg), "Error, cannot %s GPIO '%s' (pin %u): %s",
+           op, getName(), (unsigned) getPinNum(), strerror(errno));
+#endif
+  log(SysGPIO, LogError, "%s", msg);
+  throw std::runtime_error(msg);
+}
+
 /// Read the low level hardware for this pin
 PinStatus LinuxGPIOPin::readPinHardware() {
     int res = gpiod_line_get_value(line);
-    assert(res == 0 || res == 1); // FIXME throw instead
+    // gpiod reports failure as GPIOD_LINE_VALUE_ERROR (-1). Returning it would
+    // cache -1 as the pin state and fire a phantom ISR from refreshState().
+    if (res != 0 && res != 1)
+        throwLineError("read");
 
     // log(SysGPIO, LogDebug, "readPinHardware(%s, %d)", getName(), res); 
     return (PinStatus) res;
@@ -309,13 +358,26 @@ void LinuxGPIOPin::writePin(PinStatus s) {
   // some libraries have been observed failing to set the pin mode to output.
   if (GPIOPin::getPinMode() != OUTPUT)
 	setPinMode(OUTPUT);
-  GPIOPin::writePin(s); // update status
 
+  // Drive the hardware before caching. GPIOPin::writePin() records `s` as the
+  // pin's state, and once the mode is OUTPUT refreshState() stops re-reading
+  // the hardware, so a value cached for a write that never landed would be
+  // returned by digitalRead() forever.
   int res = gpiod_line_set_value(line, s);
-  assert(res == 0);
+  if (res != 0)
+    throwLineError("write");
+
+  GPIOPin::writePin(s); // update status
 }
 
 void LinuxGPIOPin::setPinMode(PinMode m) {
+#if GPIOD_V == 2
+  // Cache the mode up front: the output-value seed below reads readPin(), which
+  // must return the cached level rather than touching the hardware. If the
+  // reconfigure then fails, the cache is rolled back to `previous` -- leaving it
+  // moved would gate refreshState() on a direction the line does not have.
+  const PinMode previous = GPIOPin::getPinMode();
+#endif
   GPIOPin::setPinMode(m);
 #if GPIOD_V == 1
   // The gpiod call below does not play well with an already claimed GPIO
@@ -357,11 +419,17 @@ void LinuxGPIOPin::setPinMode(PinMode m) {
 	}
 	line_cfg = gpiod_line_config_new();
 	ret = gpiod_line_config_add_line_settings(line_cfg, &offset, 1, settings);
-	if (ret != 0)
-		log(SysGPIO, LogError, "gpiod_line_config_add_line_settings failed: %d", ret);
+	int add_ret = ret;
+	if (add_ret != 0)
+		log(SysGPIO, LogError, "gpiod_line_config_add_line_settings failed: %d", add_ret);
 	ret = gpiod_line_request_reconfigure_lines(line, line_cfg);
 	if (ret != 0)
 		log(SysGPIO, LogError, "gpiod_line_request_reconfigure_lines failed: %d", ret);
+	// Either failure means the line kept its old direction, so the cache must
+	// too.  add_line_settings is checked in its own right rather than trusting
+	// the reconfigure to fail on an empty config: the two are independent.
+	if (add_ret != 0 || ret != 0)
+		GPIOPin::setPinMode(previous);
 
 	gpiod_line_config_free(line_cfg);
 	gpiod_line_settings_free(settings);
